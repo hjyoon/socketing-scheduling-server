@@ -4,8 +4,6 @@ import cors from "@fastify/cors";
 import fastifyJwt from "@fastify/jwt";
 import fastifyRedis from "@fastify/redis";
 import fastifyPostgres from "@fastify/postgres";
-import { Server } from "socket.io";
-import { createAdapter } from "@socket.io/redis-adapter";
 import { CronJob, CronTime } from "cron";
 import { DateTime } from "luxon";
 import crypto from "node:crypto";
@@ -42,6 +40,8 @@ const schema = {
 };
 
 const jobs = new Set();
+const QUEUE_BROADCAST_CHANNEL = "socketing:queue:broadcast";
+const RESERVATION_BROADCAST_CHANNEL = "socketing:reservation:broadcast";
 
 const fastify = Fastify({
   trustProxy: true,
@@ -200,6 +200,20 @@ async function updateSeatInRedis(areaName, seatId, seat) {
   await fastify.redis.hset(`seats:${areaName}`, seatId, JSON.stringify(seat));
 }
 
+async function publishQueueMessage(message) {
+  await fastify.redis.publish(
+    QUEUE_BROADCAST_CHANNEL,
+    JSON.stringify(message)
+  );
+}
+
+async function publishReservationMessage(message) {
+  await fastify.redis.publish(
+    RESERVATION_BROADCAST_CHANNEL,
+    JSON.stringify(message)
+  );
+}
+
 async function startReservationStatusInterval(eventId, eventDateId) {
   const roomName = `${eventId}_${eventDateId}`;
   // 만약 해당 room에 대한 타이머가 없다면 생성
@@ -236,8 +250,11 @@ async function startReservationStatusInterval(eventId, eventDateId) {
       });
     }
 
-    // 해당 room에 통계 정보 전송
-    io.to(roomName).emit("reservedSeatsStatistic", areaStats);
+    await publishReservationMessage({
+      room: roomName,
+      type: "reservedSeatsStatistic",
+      payload: areaStats,
+    });
   } catch (error) {
     fastify.log.error(
       `Error emitting reservedSeatsStatistic: ${error.message}`
@@ -250,7 +267,6 @@ async function getRoomUserCount(roomName) {
   let delay = null;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      // const sockets = await io.in(roomName).fetchSockets(); // 모든 노드에서 룸에 속한 소켓 ID 가져오기
       const count = await fastify.redis.get(`room:${roomName}:count`);
       return parseInt(count || "0"); // 소켓 수 반환
     } catch (err) {
@@ -274,47 +290,10 @@ async function getQueueLength(queueName) {
   }
 }
 
-async function getQueue(queueName) {
-  const rawQueue = await fastify.redis.lrange(queueName, 0, -1);
-  return rawQueue
-    .map((item) => {
-      try {
-        return JSON.parse(item);
-      } catch (err) {
-        console.error(`Failed to parse item in queue "${queueName}":`, err);
-        return null; // 파싱 실패 시 null로 반환 (필요에 따라 처리 방식 변경 가능)
-      }
-    })
-    .filter((item) => item !== null); // null 값 제거
-}
-
-async function getSocketsInRoom(queueName) {
-  const maxRetries = 30;
-  let delay = null;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      return await io.in(queueName).fetchSockets();
-    } catch (err) {
-      console.error(
-        `Timeout reached, retrying (attempt ${attempt}/${maxRetries})...`
-      );
-      await new Promise((resolve) => {
-        delay = decorrelatedJitter(100, 60000, delay);
-        setTimeout(resolve, delay);
-      });
-    }
-  }
-}
-
 async function broadcastQueueUpdate(queueName) {
-  const queue = await getQueue(queueName);
-  const socketsInRoom = await getSocketsInRoom(queueName);
-  socketsInRoom.forEach((socket) => {
-    const position = queue.findIndex((item) => item.socketId === socket.id) + 1;
-    socket.emit("updateQueue", {
-      yourPosition: position,
-      totalWaiting: queue.length,
-    });
+  await publishQueueMessage({
+    room: queueName,
+    type: "queueStatus",
   });
 }
 
@@ -400,7 +379,11 @@ fastify.post("/scheduling/reservation/status", async (request, reply) => {
               this.stop();
             } else {
               const seatsInfo = await getReservations(eventId, eventDateId);
-              io.to(queueName).emit("seatsInfo", { seatsInfo });
+              await publishQueueMessage({
+                room: queueName,
+                type: "seatsInfo",
+                payload: { seatsInfo },
+              });
 
               // 다음 실행 시간을 5초 후로 설정
               const nextExecution = DateTime.now().plus({ seconds: 5 });
@@ -631,25 +614,6 @@ fastify.post(
     }
   }
 );
-
-const pubClient = fastify.redis.duplicate();
-const subClient = fastify.redis.duplicate();
-
-const io = new Server(fastify.server, {
-  cors: {
-    origin: "*",
-    methods: "*",
-    credentials: true,
-  },
-  transports: ["websocket"],
-  adapter: createAdapter(pubClient, subClient),
-});
-
-// 실시간 서버 시간 브로드캐스트
-setInterval(() => {
-  const serverTime = new Date().toISOString();
-  io.emit("serverTime", serverTime);
-}, 1000); // 1초마다 서버 시간 전송
 
 const startServer = async () => {
   try {
